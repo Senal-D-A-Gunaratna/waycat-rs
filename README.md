@@ -1,84 +1,89 @@
-# waycatrs
+# waycat-rs
 
-Rust rewrite of `catloop.sh` / `skull.sh` from CarloCattano/waycat, as a single
-standalone binary. Both fonts (`Waycat.ttf`, `Skulltype.ttf`) are compiled
-directly into the binary via `include_bytes!` — nothing to manually download
-or copy.
+A Rust reimplementation of `catloop.sh` from
+[CarloCattano/waycat](https://github.com/CarloCattano/waycat) — a
+CPU-driven cat animation for waybar, ported from bash to a single
+standalone binary. Only the cat is ported; `skull.sh` was not.
+
+## What it does
+
+Reads `/proc/stat`, computes CPU usage from the delta between samples,
+and prints a stream of single-letter animation frames on a timing
+loop, matching waybar's plain-text custom-module protocol. The cat has
+5 "awake" frames and 8 "sleep" frames; it drops into the sleep cycle
+after 4 consecutive low-CPU samples, same threshold and speed curve as
+the original bash script (`1 / (4 + usage*100)`, clamped to a 0.03s
+floor).
+
+Click-to-sleep: `waycat-rs toggle` sends `SIGUSR1` to the running
+daemon, which flips an in-memory flag that forces the sleep animation
+regardless of CPU load — no lock file, nothing written to disk or
+tmpfs. While forced-sleep is active, the daemon stops polling
+`/proc/stat` entirely and just cycles frames on a fixed cadence;
+polling resumes the instant it's toggled back off.
 
 ## Build
 
+Requires the `x86_64-unknown-linux-musl` target:
+
 ```
-cd waycatrs
+rustup target add x86_64-unknown-linux-musl
+```
+
+The project's `.cargo/config.toml` pins the default build target to
+musl, so a plain release build already produces a fully static binary
+with no runtime linker dependency:
+
+```
 cargo build --release
 ```
 
-Binary lands at `target/release/waycatrs`. Copy it wherever you like, e.g.
-`~/.local/bin/waycatrs`. Fully standalone from there — `assets/` is only
-needed at compile time.
+Binary lands at `target/x86_64-unknown-linux-musl/release/waycat-rs`.
+Copy it wherever you like, e.g. `~/.config/scripts/waycat-rs`.
 
-## Font install location — fully self-contained
+## Fonts
 
-Fonts are written to their own subfolder, `~/.local/share/fonts/waycatrs/`,
-on first run of each mode. fontconfig scans `~/.local/share/fonts`
-_recursively_ by default, so this subfolder is auto-discovered with **zero
-config file edits** — the binary never touches `fonts.conf`, `~/.config`,
-or anything outside its own subfolder. Nothing is mixed in with your other
-installed fonts either, since it's contained in `waycatrs/` rather than
-sitting flat in the fonts directory.
+Fonts are **not** bundled into the binary — install them manually,
+same as upstream `waycat`:
 
-Both `Waycat.ttf` and `Skulltype.ttf` are kept side by side once either mode
-has run — this is deliberate, since a typical waybar config runs
-`custom/cpucat` and `custom/skull` concurrently, and having one mode delete
-the other's font out from under it would break whichever module runs second.
-
-Every run after the first is a no-op on the install step — it checks the
-file's already there at the right size — so there's no per-launch overhead
-in steady state, and `fc-cache -f` only runs the first time a font is
-actually written.
+```
+cp fonts/Waycat.ttf ~/.local/share/fonts/
+fc-cache -f
+```
 
 ## Usage
 
 ```
-waycatrs cat     # replaces catloop.sh (default if no arg given)
-waycatrs skull   # replaces skull.sh
+waycat-rs           # run the daemon (prints frames on a loop, forever)
+waycat-rs toggle     # signal a running daemon to force sleep / wake it back up
 ```
-
-Each loop iteration prints one JSON line to stdout and flushes, matching
-waybar's streaming custom-module protocol:
-
-```json
-{ "text": "A", "tooltip": "CPU: 12.3%", "class": "awake" }
-```
-
-`class` is one of `awake`, `sleep`, or (skull-only) `busy` when CPU > 60%,
-so you can target `#custom-cpucat.sleep`, `#custom-skull.busy`, etc. in your
-waybar CSS if you want state-based styling beyond the base font/color rules.
 
 ## Waybar config
 
-Same shape as upstream, just point exec at the compiled binary and add
-`"return-type": "json"`:
-
 ```json
-"custom/cpucat": {
-    "exec": "~/.local/bin/waycat-rs cat",
-    "return-type": "json",
-    "spacing": 1
-},
-"custom/skull": {
-    "exec": "~/.local/bin/waycat-rs skull",
-    "return-type": "json",
-    "spacing": 1
+  "custom/waycat-rs": {
+    "exec": "pkill waycat-rs ; ~/.config/scripts/waycat-rs",
+    "on-click": "~/.config/scripts/waycat-rs toggle",
+    "spacing": 1,
+    "format": "{}",
+    "tooltip": false,
+  },
+```
+
+```css
+#custom-waycat-rs {
+  font-family: "Waycat", monospace;
+  font-size: 16px;
+  font-weight: bold;
 }
 ```
 
 ## Behavior parity notes
 
-- CPU sampling, delta calc, and speed formula (`1 / (4 + usage*100)`, min-speed
-  clip) match the bash originals exactly.
-- Cat: 5 awake frames (A-E), 8 sleep frames (G-N), sleeps after 4 consecutive
-  low-CPU samples (<2%).
-- Skull: 19 awake frames (A-S) split at CPU>60% into first-9 (A-I, "busy") vs
-  remaining (J-S, "awake"), 20 sleep frames (a-t).
-- No `bc`, `awk`, subshells, manually-installed fonts, or config file edits —
-  one self-contained binary, no shell dependency.
+- CPU sampling, delta calc, and speed formula match `catloop.sh`
+  exactly.
+- No `bc` or `awk` subprocess spawned per frame (the original bash
+  script forked both on every tick).
+- Toggle state lives only in the daemon's own process memory,
+  flipped via a `SIGUSR1` handler — not a file, not shared memory,
+  not polled from disk.
