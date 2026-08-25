@@ -28,8 +28,13 @@
   waybar will call it here and it will run endlessly
 
 ```json
- "custom/cpucat": {
-        "exec":"~/scripts/catloop.sh",
+"custom/cpucat": {
+  "exec": "pkill waycat ; ~/.config/scripts/waycat",
+  "on-click": "~/.config/scripts/waycat toggle",
+  "spacing": 1,
+  "format": "{}",
+  "tooltip": false,
+},
 ```
 
 example test font:
