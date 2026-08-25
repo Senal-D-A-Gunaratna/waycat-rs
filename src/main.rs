@@ -1,9 +1,17 @@
+use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::thread::sleep;
 use std::time::Duration;
 
 const SLEEP_AFTER: u32 = 4;
+
+/// Path to the lock file that, when present, forces sleep frames regardless of CPU usage.
+fn lock_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".cache/catloop_sleep")
+}
 
 // A..E
 const AWAKE_FRAMES: [char; 5] = ['A', 'B', 'C', 'D', 'E'];
@@ -44,10 +52,52 @@ fn emit(frame: char, speed: f64) {
 }
 
 fn main() -> io::Result<()> {
+    // `catloop toggle` flips the forced-sleep lock and exits — this is what
+    // waybar's on-click should call.
+    let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("toggle") {
+        let path = lock_path();
+        if path.exists() {
+            fs::remove_file(&path)?;
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, b"")?;
+        }
+        return Ok(());
+    }
+
+    let lock = lock_path();
     let (mut prev_active, mut prev_total) = read_cpu()?;
     let mut count: u32 = 0;
 
+    // Fixed cadence used while forced-sleep is active, so we don't touch
+    // /proc/stat at all during that time.
+    const FORCED_SLEEP_SPEED: f64 = 0.2;
+
     loop {
+        if lock.exists() {
+            // CAT IS FORCED ASLEEP — no CPU polling while this holds.
+            for &f in SLEEP_FRAMES.iter() {
+                emit(f, FORCED_SLEEP_SPEED);
+                // Bail out mid-animation as soon as it's unlocked, so
+                // clicking again feels responsive instead of waiting out
+                // the whole sleep cycle.
+                if !lock.exists() {
+                    break;
+                }
+            }
+            // Resync the CPU baseline for when polling resumes, so the
+            // first post-wake reading isn't measured across a huge gap.
+            if let Ok((a, t)) = read_cpu() {
+                prev_active = a;
+                prev_total = t;
+            }
+            count = 0;
+            continue;
+        }
+
         let (active, total) = read_cpu()?;
 
         let delta_active = active as i64 - prev_active as i64;
