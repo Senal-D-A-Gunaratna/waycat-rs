@@ -1,13 +1,18 @@
 [package]
-name = "waycatrs"
+name = "waycat-rs"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "waycatrs"
+name = "waycat-rs"
 path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = "z"
 lto = true
 strip = true
+panic = "abort"
+codegen-units = 1
