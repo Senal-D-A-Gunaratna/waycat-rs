@@ -1,52 +1,90 @@
-# waycat
+# waycatrs
 
-![catskull_18_01_08_20](https://github.com/user-attachments/assets/5d333cf8-326b-43f0-be5a-af816d49dc16)
+Rust rewrite of `catloop.sh` / `skull.sh` from CarloCattano/waycat, as a single
+standalone binary. Both fonts (`Waycat.ttf`, `Skulltype.ttf`) are compiled
+directly into the binary via `include_bytes!` — nothing to manually download
+or copy.
 
-[waybar](https://github.com/Alexays/Waybar) animated icons custom module
+## Build
 
-# Encoding svgs into fonts
-
-- take svg files and load them into a font editing
-- Export to ttf -> put fonts in ~/.local/share/fonts
-- use font in custom class in waybar style.css
-- run the script on the waybar via custom module
-
-~/.config/waybar/style.css
-
-```css
-#custom-cpucat {
-  font-family: "Waycat", monospace;
-  font-size: 32px;
-  font-weight: bold;
-  color: white;
-  padding-left: 8px;
-  padding-right: 8px;
-}
+```
+cd waycatrs
+cargo build --release
 ```
 
-- put the catloop.sh script in ~/scripts or any other path you like
-  waybar will call it here and it will run endlessly
+Binary lands at `target/release/waycatrs`. Copy it wherever you like, e.g.
+`~/.local/bin/waycatrs`. Fully standalone from there — `assets/` is only
+needed at compile time.
+
+## Font install location — fully self-contained
+
+Fonts are written to their own subfolder, `~/.local/share/fonts/waycatrs/`,
+on first run of each mode. fontconfig scans `~/.local/share/fonts`
+*recursively* by default, so this subfolder is auto-discovered with **zero
+config file edits** — the binary never touches `fonts.conf`, `~/.config`,
+or anything outside its own subfolder. Nothing is mixed in with your other
+installed fonts either, since it's contained in `waycatrs/` rather than
+sitting flat in the fonts directory.
+
+Both `Waycat.ttf` and `Skulltype.ttf` are kept side by side once either mode
+has run — this is deliberate, since a typical waybar config runs
+`custom/cpucat` and `custom/skull` concurrently, and having one mode delete
+the other's font out from under it would break whichever module runs second.
+
+Every run after the first is a no-op on the install step — it checks the
+file's already there at the right size — so there's no per-launch overhead
+in steady state, and `fc-cache -f` only runs the first time a font is
+actually written.
+
+## Usage
+
+```
+waycatrs cat     # replaces catloop.sh (default if no arg given)
+waycatrs skull   # replaces skull.sh
+```
+
+Each loop iteration prints one JSON line to stdout and flushes, matching
+waybar's streaming custom-module protocol:
+
+```json
+{"text":"A","tooltip":"CPU: 12.3%","class":"awake"}
+```
+
+`class` is one of `awake`, `sleep`, or (skull-only) `busy` when CPU > 60%,
+so you can target `#custom-cpucat.sleep`, `#custom-skull.busy`, etc. in your
+waybar CSS if you want state-based styling beyond the base font/color rules.
+
+## Waybar config
+
+Same shape as upstream, just point exec at the compiled binary and add
+`"return-type": "json"`:
 
 ```json
 "custom/cpucat": {
-  "exec": "pkill waycat ; ~/.config/scripts/waycat",
-  "on-click": "~/.config/scripts/waycat toggle",
-  "spacing": 1,
-  "format": "{}",
-  "tooltip": false,
+    "exec": "~/.local/bin/waycatrs cat",
+    "return-type": "json",
+    "spacing": 1
 },
+"custom/skull": {
+    "exec": "~/.local/bin/waycatrs skull",
+    "return-type": "json",
+    "spacing": 1
+}
 ```
 
-example test font:
-A-E Cat running
-G-J Cat sleeping
+## Behavior parity notes
 
-inspired by [https://github.com/win0err/gnome-runcat](gnome-runcat)
+- CPU sampling, delta calc, and speed formula (`1 / (4 + usage*100)`, min-speed
+  clip) match the bash originals exactly.
+- Cat: 5 awake frames (A-E), 8 sleep frames (G-N), sleeps after 4 consecutive
+  low-CPU samples (<2%).
+- Skull: 19 awake frames (A-S) split at CPU>60% into first-9 (A-I, "busy") vs
+  remaining (J-S, "awake"), 20 sleep frames (a-t).
+- No `bc`, `awk`, subshells, manually-installed fonts, or config file edits —
+  one self-contained binary, no shell dependency.
 
-## Examples
 
-A gnome-cat cpu monitor is provided and a Skull.
-
+  
 # Compiling
 
 ```bash
