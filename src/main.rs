@@ -33,7 +33,7 @@ extern "C" fn handle_toggle(_sig: libc::c_int) {
 /// std doesn't expose safely.
 fn install_signal_handler() {
     unsafe {
-        libc::signal(libc::SIGUSR1, handle_toggle as usize);
+        libc::signal(libc::SIGUSR1, handle_toggle as *const () as usize);
     }
 }
 
