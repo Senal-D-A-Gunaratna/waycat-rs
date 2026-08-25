@@ -8,9 +8,12 @@ use std::time::Duration;
 const SLEEP_AFTER: u32 = 4;
 
 /// Path to the lock file that, when present, forces sleep frames regardless of CPU usage.
+/// Uses XDG_RUNTIME_DIR (tmpfs on systemd systems) so it lives in RAM and is
+/// automatically cleared on logout/reboot, rather than lingering on disk.
 fn lock_path() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".cache/catloop_sleep")
+    let runtime_dir = env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/tmp/catloop-{}", env::var("USER").unwrap_or_default()));
+    PathBuf::from(runtime_dir).join("catloop_sleep")
 }
 
 // A..E
