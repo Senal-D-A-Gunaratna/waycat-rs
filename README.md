@@ -20,7 +20,7 @@ needed at compile time.
 
 Fonts are written to their own subfolder, `~/.local/share/fonts/waycatrs/`,
 on first run of each mode. fontconfig scans `~/.local/share/fonts`
-*recursively* by default, so this subfolder is auto-discovered with **zero
+_recursively_ by default, so this subfolder is auto-discovered with **zero
 config file edits** — the binary never touches `fonts.conf`, `~/.config`,
 or anything outside its own subfolder. Nothing is mixed in with your other
 installed fonts either, since it's contained in `waycatrs/` rather than
@@ -47,7 +47,7 @@ Each loop iteration prints one JSON line to stdout and flushes, matching
 waybar's streaming custom-module protocol:
 
 ```json
-{"text":"A","tooltip":"CPU: 12.3%","class":"awake"}
+{ "text": "A", "tooltip": "CPU: 12.3%", "class": "awake" }
 ```
 
 `class` is one of `awake`, `sleep`, or (skull-only) `busy` when CPU > 60%,
@@ -61,12 +61,12 @@ Same shape as upstream, just point exec at the compiled binary and add
 
 ```json
 "custom/cpucat": {
-    "exec": "~/.local/bin/waycatrs cat",
+    "exec": "~/.local/bin/waycat-rs cat",
     "return-type": "json",
     "spacing": 1
 },
 "custom/skull": {
-    "exec": "~/.local/bin/waycatrs skull",
+    "exec": "~/.local/bin/waycat-rs skull",
     "return-type": "json",
     "spacing": 1
 }
@@ -82,12 +82,3 @@ Same shape as upstream, just point exec at the compiled binary and add
   remaining (J-S, "awake"), 20 sleep frames (a-t).
 - No `bc`, `awk`, subshells, manually-installed fonts, or config file edits —
   one self-contained binary, no shell dependency.
-
-
-  
-# Compiling
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-```
