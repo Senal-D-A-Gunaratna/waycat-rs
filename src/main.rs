@@ -1,185 +1,186 @@
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
-use std::process::Command;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::sleep;
 use std::time::Duration;
 
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
-    Cat,
-    Skull,
+const SLEEP_AFTER: u32 = 4;
+
+// A..E
+const AWAKE_FRAMES: [char; 5] = ['A', 'B', 'C', 'D', 'E'];
+// G..N
+const SLEEP_FRAMES: [char; 8] = ['G', 'H', 'I', 'J', 'K', 'L', 'M', 'N'];
+
+/// The forced-sleep bit itself. Lives only in this process's memory —
+/// no file, no tmpfs, nothing on any filesystem. Flipped exclusively from
+/// the SIGUSR1 handler below, which is why it has to be an atomic: signal
+/// handlers can run at any point, including mid-instruction on another
+/// thread, so a plain `bool` write wouldn't be safe here.
+static FORCED_SLEEP: AtomicBool = AtomicBool::new(false);
+
+/// Signal handler for SIGUSR1: flip the bit and return immediately.
+/// Only async-signal-safe operations are allowed inside a signal handler
+/// (no allocation, no I/O) — an atomic store is one of the few things
+/// that's guaranteed safe here.
+extern "C" fn handle_toggle(_sig: libc::c_int) {
+    let current = FORCED_SLEEP.load(Ordering::Relaxed);
+    FORCED_SLEEP.store(!current, Ordering::Relaxed);
 }
 
-// Fonts are baked into the binary at compile time, no separate .ttf files
-// need to be shipped or manually installed by the user.
-static WAYCAT_TTF: &[u8] = include_bytes!("../assets/Waycat.ttf");
-static SKULLTYPE_TTF: &[u8] = include_bytes!("../assets/Skulltype.ttf");
-
-/// waycatrs keeps its font copy in its own subfolder under
-/// ~/.local/share/fonts, e.g. ~/.local/share/fonts/waycatrs/Waycat.ttf,
-/// rather than dumping loose files into the flat font directory.
-/// fontconfig scans ~/.local/share/fonts *recursively* by default, so this
-/// subfolder is auto-discovered with zero config file edits — nothing
-/// outside its own directory is ever touched.
-fn waycatrs_font_dir(home: &str) -> PathBuf {
-    [home, ".local", "share", "fonts", "waycatrs"].iter().collect()
+/// Installs the SIGUSR1 handler using raw libc::signal — no crates.io
+/// dependency beyond libc itself, since this is the one C-level FFI call
+/// std doesn't expose safely.
+fn install_signal_handler() {
+    unsafe {
+        libc::signal(libc::SIGUSR1, handle_toggle as usize);
+    }
 }
 
-/// Write the given font's bytes into ~/.local/share/fonts/waycatrs if not
-/// already present with the same size, and refresh the font cache only
-/// when something actually changed. Both fonts can coexist here — cat and
-/// skull modules typically run concurrently in waybar, so neither mode
-/// touches or removes the other's file.
-fn ensure_font_installed(filename: &str, bytes: &[u8]) {
-    let home = match env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return, // no HOME, nothing sane to do; skip silently
-    };
+/// Scans /proc for a running `waycat-rs` daemon (any PID besides our own)
+/// and sends it SIGUSR1. This is what `waycat-rs toggle` does instead of
+/// touching a lock file — the "message" is the signal itself, and the
+/// state it flips lives only in the target process's RAM.
+fn send_toggle_signal() -> io::Result<()> {
+    let my_pid = std::process::id();
+    let mut sent = false;
 
-    let font_dir = waycatrs_font_dir(&home);
-    let font_path = font_dir.join(filename);
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = match name.to_str() {
+            Some(n) => n,
+            None => continue,
+        };
+        let pid: i32 = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue, // not a PID directory
+        };
+        if pid as u32 == my_pid {
+            continue;
+        }
 
-    let needs_write = match fs::metadata(&font_path) {
-        Ok(meta) => meta.len() as usize != bytes.len(),
-        Err(_) => true,
-    };
+        let comm_path = entry.path().join("comm");
+        let comm = match fs::read_to_string(&comm_path) {
+            Ok(c) => c,
+            Err(_) => continue, // process exited, or unreadable — skip
+        };
 
-    if !needs_write {
-        return;
+        if comm.trim() == "waycat-rs" {
+            unsafe {
+                libc::kill(pid, libc::SIGUSR1);
+            }
+            sent = true;
+        }
     }
 
-    if fs::create_dir_all(&font_dir).is_err() {
-        return;
+    if !sent {
+        eprintln!("waycat-rs: no running daemon found to toggle");
     }
-    if fs::write(&font_path, bytes).is_err() {
-        return;
-    }
-
-    // Best-effort cache refresh; ignore failures (e.g. fc-cache missing).
-    let _ = Command::new("fc-cache").arg("-f").output();
+    Ok(())
 }
 
+/// Reads the aggregate "cpu " line from /proc/stat and returns (active, total) jiffies.
 fn read_cpu() -> io::Result<(u64, u64)> {
-    let stat = fs::read_to_string("/proc/stat")?;
-    let line = stat
+    let contents = fs::read_to_string("/proc/stat")?;
+    let line = contents
         .lines()
         .find(|l| l.starts_with("cpu "))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cpu line in /proc/stat"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no cpu line in /proc/stat"))?;
 
-    let mut fields = line.split_whitespace().skip(1);
-    let user: u64 = fields.next().unwrap_or("0").parse().unwrap_or(0);
-    let nice: u64 = fields.next().unwrap_or("0").parse().unwrap_or(0);
-    let sys: u64 = fields.next().unwrap_or("0").parse().unwrap_or(0);
-    let idle: u64 = fields.next().unwrap_or("0").parse().unwrap_or(0);
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1) // skip "cpu"
+        .filter_map(|f| f.parse::<u64>().ok())
+        .collect();
+
+    // user nice system idle [iowait irq softirq steal guest guest_nice]
+    let user = fields.get(0).copied().unwrap_or(0);
+    let nice = fields.get(1).copied().unwrap_or(0);
+    let sys = fields.get(2).copied().unwrap_or(0);
+    let idle = fields.get(3).copied().unwrap_or(0);
 
     let active = user + nice + sys;
     let total = active + idle;
+
     Ok((active, total))
 }
 
-/// Emit a single waybar custom-module JSON line and flush stdout.
-fn emit(text: char, cpu_pct: f64, class: &str) {
-    // text/class are always plain ASCII letters here, no escaping needed.
-    println!(
-        "{{\"text\":\"{}\",\"tooltip\":\"CPU: {:.1}%\",\"class\":\"{}\"}}",
-        text, cpu_pct, class
-    );
+fn emit(frame: char, speed: f64) {
+    print!("{frame}\n");
     let _ = io::stdout().flush();
+    sleep(Duration::from_secs_f64(speed));
 }
 
-fn frame(base: u8, offset: u8) -> char {
-    (base + offset) as char
-}
-
-fn main() {
-    let mode = match env::args().nth(1).as_deref() {
-        Some("skull") => Mode::Skull,
-        _ => Mode::Cat, // default, matches catloop.sh behavior
-    };
-
-    // Install only the font this mode needs, straight out of the binary.
-    // Both cat's and skull's fonts can coexist in the cache dir since
-    // waybar typically runs both modules at once.
-    match mode {
-        Mode::Cat => ensure_font_installed("Waycat.ttf", WAYCAT_TTF),
-        Mode::Skull => ensure_font_installed("Skulltype.ttf", SKULLTYPE_TTF),
+fn main() -> io::Result<()> {
+    // `waycat-rs toggle` doesn't run the loop at all — it just signals the
+    // already-running daemon and exits. This is what waybar's on-click calls.
+    let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("toggle") {
+        return send_toggle_signal();
     }
 
-    let sleep_after: u32 = 4;
-    let mut low_cpu_count: u32 = 0;
+    install_signal_handler();
 
-    let (mut prev_active, mut prev_total) = read_cpu().unwrap_or((0, 0));
+    let (mut prev_active, mut prev_total) = read_cpu()?;
+    let mut count: u32 = 0;
+
+    // Fixed cadence used while forced-sleep is active, so we don't touch
+    // /proc/stat at all during that time.
+    const FORCED_SLEEP_SPEED: f64 = 0.2;
 
     loop {
-        let (active, total) = match read_cpu() {
-            Ok(v) => v,
-            Err(_) => {
-                thread::sleep(Duration::from_millis(500));
-                continue;
+        if FORCED_SLEEP.load(Ordering::Relaxed) {
+            // CAT IS FORCED ASLEEP — no CPU polling while this holds.
+            for &f in SLEEP_FRAMES.iter() {
+                emit(f, FORCED_SLEEP_SPEED);
+                // Bail out mid-animation as soon as it's unset, so toggling
+                // again feels responsive instead of waiting out the cycle.
+                if !FORCED_SLEEP.load(Ordering::Relaxed) {
+                    break;
+                }
             }
-        };
+            // Resync the CPU baseline for when polling resumes, so the
+            // first post-wake reading isn't measured across a huge gap.
+            if let Ok((a, t)) = read_cpu() {
+                prev_active = a;
+                prev_total = t;
+            }
+            count = 0;
+            continue;
+        }
+
+        let (active, total) = read_cpu()?;
 
         let delta_active = active as i64 - prev_active as i64;
         let delta_total = total as i64 - prev_total as i64;
 
-        let cpu_usage: f64 = if delta_total <= 0 || delta_active < 0 {
+        let cpu_usage = if delta_total <= 0 || delta_active < 0 {
             0.0
         } else {
             delta_active as f64 / delta_total as f64
         };
 
-        let min_speed = match mode {
-            Mode::Cat => 0.03,
-            Mode::Skull => 0.05,
-        };
-        let speed = (1.0 / (4.0 + cpu_usage * 100.0)).max(min_speed);
-        let speed_dur = Duration::from_secs_f64(speed);
-
-        if cpu_usage < 0.02 {
-            low_cpu_count += 1;
-        } else {
-            low_cpu_count = 0;
+        let mut speed = 1.0 / (4.0 + (cpu_usage * 100.0));
+        if speed < 0.03 {
+            speed = 0.03;
         }
 
-        let sleeping = low_cpu_count >= sleep_after;
+        if cpu_usage < 0.02 {
+            count += 1;
+        } else {
+            count = 0;
+        }
 
-        match mode {
-            Mode::Cat => {
-                // AWAKE_FRAMES A..E, SLEEP_FRAMES G..N
-                if sleeping {
-                    for i in 0..8u8 {
-                        emit(frame(b'G', i), cpu_usage * 100.0, "sleep");
-                        thread::sleep(speed_dur);
-                    }
-                } else {
-                    for i in 0..5u8 {
-                        emit(frame(b'A', i), cpu_usage * 100.0, "awake");
-                        thread::sleep(speed_dur);
-                    }
-                }
+        if count >= SLEEP_AFTER {
+            // CAT IS SLEEPING
+            for &f in SLEEP_FRAMES.iter() {
+                emit(f, speed);
             }
-            Mode::Skull => {
-                // AWAKE_FRAMES A..S (19), SLEEP_FRAMES a..t (20)
-                if sleeping {
-                    for i in 0..20u8 {
-                        emit(frame(b'a', i), cpu_usage * 100.0, "sleep");
-                        thread::sleep(speed_dur);
-                    }
-                } else if cpu_usage > 0.6 {
-                    // AWAKE_FRAMES[0:9] -> A..I
-                    for i in 0..9u8 {
-                        emit(frame(b'A', i), cpu_usage * 100.0, "busy");
-                        thread::sleep(speed_dur);
-                    }
-                } else {
-                    // AWAKE_FRAMES[9:] -> J..S
-                    for i in 9..19u8 {
-                        emit(frame(b'A', i), cpu_usage * 100.0, "awake");
-                        thread::sleep(speed_dur);
-                    }
-                }
+        } else {
+            // CAT IS AWAKE
+            for &f in AWAKE_FRAMES.iter() {
+                emit(f, speed);
             }
         }
 
